@@ -95,16 +95,16 @@ class TDMPC2(struct.PyTreeNode):
           *,
           key: PRNGKeyArray
           ) -> Tuple[np.ndarray, Optional[Tuple[jax.Array]]]:
-    plan_key, encoder_key = jax.random.split(key, 2)
+    encoder_key, action_key = jax.random.split(key, 2)
     z = self.model.encode(obs, self.model.encoder.params, key=encoder_key)
 
     if self.mpc:
       if prev_plan is None:
         batch_dims = z.shape[:-1]
         prev_plan = (
-            jnp.zeros((*batch_dims, self.horizon+1, self.model.action_dim)),
+            jnp.zeros((*batch_dims, self.horizon, self.model.action_dim)),
             jnp.full(
-                (*batch_dims, self.horizon+1, self.model.action_dim),
+                (*batch_dims, self.horizon, self.model.action_dim),
                 self.max_plan_std
             )
         )
@@ -112,11 +112,11 @@ class TDMPC2(struct.PyTreeNode):
           z=z,
           prev_plan=prev_plan,
           train=train,
-          key=plan_key
+          key=action_key
       )
     else:
       action = self.model.sample_actions(
-          z, self.model.policy_model.params, key=plan_key
+          z, self.model.policy_model.params, key=action_key
       )[0]
       plan = None
 
@@ -135,7 +135,7 @@ class TDMPC2(struct.PyTreeNode):
         (
             *batch_shape,
             self.population_size,
-            self.horizon+1,
+            self.horizon,
             self.model.action_dim
         )
     )
@@ -144,23 +144,23 @@ class TDMPC2(struct.PyTreeNode):
     # Policy prior samples
     ###########################################################
     if self.policy_prior_samples > 0:
-      key, *prior_noise_keys = jax.random.split(key, 1+(self.horizon+1))
+      key, *prior_noise_keys = jax.random.split(key, 1+self.horizon)
       policy_actions = jnp.zeros(
           (
               *batch_shape,
               self.policy_prior_samples,
-              self.horizon+1,
+              self.horizon,
               self.model.action_dim
           )
       )
       z_t = z[..., None, :].repeat(self.policy_prior_samples, axis=-2)
-      for t in range(self.horizon+1):
+      for t in range(self.horizon):
         policy_actions = policy_actions.at[..., t, :].set(
             self.model.sample_actions(
                 z_t, self.model.policy_model.params, key=prior_noise_keys[t]
             )[0]
         )
-        if t < self.horizon:  # Don't need for the last time step
+        if t < self.horizon-1:  # Don't need for the last time step
           z_t = self.model.next(
               z_t,
               policy_actions[..., t, :],
@@ -175,41 +175,33 @@ class TDMPC2(struct.PyTreeNode):
     # MPPI planning
     ###########################################################
     z_t = z[..., None, :].repeat(self.population_size, axis=-2)
-    key, init_noise_key, mppi_noise_key, *value_keys = jax.random.split(
-        key, 3+self.mppi_iterations
-    )
-    init_noise = jax.random.normal(
-        init_noise_key,
-        shape=(
-            *batch_shape,
-            self.population_size - self.policy_prior_samples,
-            self.horizon+1,
-            self.model.action_dim
-        )
+    key, mppi_noise_key, *value_keys = jax.random.split(
+        key, 2+self.mppi_iterations
     )
     noise = jax.random.normal(
         mppi_noise_key,
         shape=(
             *batch_shape,
-            self.population_size - self.num_elites,
+            self.population_size - self.policy_prior_samples,
             self.mppi_iterations,
-            self.horizon+1,
+            self.horizon,
             self.model.action_dim
         )
     )
     # Initialize population state
-    mean = jnp.zeros((*batch_shape, self.horizon+1, self.model.action_dim))
+    mean = jnp.zeros((*batch_shape, self.horizon, self.model.action_dim))
     std = jnp.full(
-        (*batch_shape, self.horizon+1, self.model.action_dim),
+        (*batch_shape, self.horizon, self.model.action_dim),
         self.max_plan_std
     )
     mean = mean.at[..., :-1, :].set(prev_plan[0][..., 1:, :])
     std = std.at[..., :-1, :].set(prev_plan[1][..., 1:, :])
-    actions = actions.at[..., self.policy_prior_samples:, :, :].set(
-        mean[..., None, :, :] + std[..., None, :, :] * init_noise
-    ).clip(-1, 1)
 
     for i in range(self.mppi_iterations):
+      actions = actions.at[..., self.policy_prior_samples:, :, :].set(
+          mean[..., None, :, :] + std[..., None, :, :] * noise[..., i, :, :]
+      ).clip(-1, 1)
+
       # Compute elites
       values = self.estimate_value(z_t, actions, key=value_keys[i])
       elite_values, elite_inds = jax.lax.top_k(values, self.num_elites)
@@ -228,29 +220,21 @@ class TDMPC2(struct.PyTreeNode):
           )
       ).clip(self.min_plan_std, self.max_plan_std)
 
-      # Update non-elite actions
-      if i < self.mppi_iterations - 1:
-        actions = actions.at[..., :self.num_elites, :, :].set(elite_actions)
-        actions = actions.at[..., self.num_elites:, :, :].set(
-            mean[..., None, :, :] + std[..., None, :, :] * noise[..., i, :, :]
-        ).clip(-1, 1)
-
     # Select final action
+    key, final_action_key = jax.random.split(key)
+    action_ind = jax.random.categorical(
+        final_action_key, logits=elite_values, shape=batch_shape
+    )
+    action = jnp.take_along_axis(
+        elite_actions[..., 0, :], action_ind[..., None, None], axis=-2
+    ).squeeze(-2)
     if train:
-      key, final_action_key = jax.random.split(key)
-      action_ind = jax.random.categorical(
-          final_action_key, logits=elite_values, shape=batch_shape
+      key, final_noise_key = jax.random.split(key)
+      action += std[..., 0, :] * jax.random.normal(
+          final_noise_key, shape=batch_shape + (self.model.action_dim,)
       )
-      action = jnp.take_along_axis(
-          elite_actions[..., 0, :], action_ind[..., None, None], axis=-2
-      ).squeeze(-2)
-    else:
-      action_ind = jnp.argmax(elite_values, axis=-2)
-      action = jnp.take_along_axis(
-          elite_actions[..., 0, :], action_ind[..., None, None], axis=-2
-      ).squeeze(-2)
 
-    return action, (mean, std)
+    return action.clip(-1, 1), (mean, std)
 
   @jax.jit
   def update(self,
