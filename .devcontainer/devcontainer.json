@@ -1,0 +1,25 @@
+{
+  "name": "CUDA Dev Container",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "runArgs": [
+    "--gpus",
+    "all"
+  ],
+  "remoteUser": "root",
+  "postCreateCommand": "conda init",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/main"
+      },
+      "extensions": [
+        "ms-python.python",
+        "GitHub.codespaces",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
