@@ -256,10 +256,11 @@ class WorldModel(struct.PyTreeNode):
     )
     return reward, logits
 
-  @jax.jit
+  @partial(jax.jit, static_argnames=('deterministic',))
   def sample_actions(self,
                      z: jax.Array,
                      params: Dict,
+                     deterministic: bool = False,
                      min_log_std: float = -10,
                      max_log_std: float = 2,
                      *,
@@ -273,8 +274,12 @@ class WorldModel(struct.PyTreeNode):
         (max_log_std - min_log_std) * (jnp.tanh(log_std) + 1)
 
     # Sample action and compute logprobs
-    eps = jax.random.normal(key, mean.shape)
-    action = mean + eps * jnp.exp(log_std)
+    if deterministic:
+        eps = jnp.zeros_like(mean)
+        action = mean
+    else:
+        eps = jax.random.normal(key, mean.shape)
+        action = mean + eps * jnp.exp(log_std)
     residual = (-0.5 * eps**2 - log_std).sum(-1)
     log_probs = action.shape[-1] * (residual - 0.5 * jnp.log(2 * jnp.pi))
 

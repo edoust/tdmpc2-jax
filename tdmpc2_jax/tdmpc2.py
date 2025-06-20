@@ -20,7 +20,6 @@ class TDMPC2(struct.PyTreeNode):
   value_scale: jax.Array
 
   # Planning
-  mpc: bool
   horizon: int = struct.field(pytree_node=False)
   mppi_iterations: int = struct.field(pytree_node=False)
   population_size: int = struct.field(pytree_node=False)
@@ -33,10 +32,11 @@ class TDMPC2(struct.PyTreeNode):
   batch_size: int = struct.field(pytree_node=False)
   discount: float
   rho: float
-  consistency_coef: float
-  reward_coef: float
-  value_coef: float
-  continue_coef: float
+  rho_loss_scale: float
+  consistency_loss_scale: float
+  reward_loss_scale: float
+  value_loss_scale: float
+  continue_loss_scale: float
   entropy_coef: float
   tau: float
 
@@ -44,7 +44,6 @@ class TDMPC2(struct.PyTreeNode):
   def create(cls,
              world_model: WorldModel,
              # Planning
-             mpc: bool,
              horizon: int,
              mppi_iterations: int,
              population_size: int,
@@ -57,16 +56,15 @@ class TDMPC2(struct.PyTreeNode):
              discount: float,
              batch_size: int,
              rho: float,
-             consistency_coef: float,
-             reward_coef: float,
-             value_coef: float,
-             continue_coef: float,
+             consistency_loss_scale: float,
+             reward_loss_scale: float,
+             value_loss_scale: float,
+             continue_loss_scale: float,
              entropy_coef: float,
              tau: float
              ) -> TDMPC2:
 
     return cls(model=world_model,
-               mpc=mpc,
                horizon=horizon,
                mppi_iterations=mppi_iterations,
                population_size=population_size,
@@ -78,18 +76,21 @@ class TDMPC2(struct.PyTreeNode):
                discount=discount,
                batch_size=batch_size,
                rho=rho,
-               consistency_coef=consistency_coef,
-               reward_coef=reward_coef,
-               value_coef=value_coef,
-               continue_coef=continue_coef,
+               rho_loss_scale=jnp.sum(rho**jnp.arange(horizon)),
+               consistency_loss_scale=consistency_loss_scale,
+               reward_loss_scale=reward_loss_scale,
+               value_loss_scale=value_loss_scale,
+               continue_loss_scale=continue_loss_scale,
                entropy_coef=entropy_coef,
                tau=tau,
                value_scale=jnp.array([1.0]),
                )
 
+  @partial(jax.jit, static_argnames=('mpc', 'deterministic', 'train'))
   def act(self,
           obs: PyTree,
           prev_plan: Optional[Tuple[jax.Array, jax.Array]] = None,
+          mpc: bool = True,
           deterministic: bool = False,
           train: bool = False,
           *,
@@ -102,7 +103,7 @@ class TDMPC2(struct.PyTreeNode):
         key=encoder_key
     )
 
-    if self.mpc:
+    if mpc:
       action, plan = self.plan(
           z=z,
           horizon=self.horizon,
@@ -112,14 +113,15 @@ class TDMPC2(struct.PyTreeNode):
           key=action_key
       )
     else:
-      action = self.model.sample_actions(
+      action, _, _, _ = self.model.sample_actions(
           z=z,
+          deterministic=deterministic,
           params=self.model.policy_model.params,
           key=action_key
-      )[0]
+      )
       plan = None
 
-    return np.array(action), plan
+    return action, plan
 
   @partial(jax.jit, static_argnames=('horizon', 'deterministic', 'train'))
   def plan(self,
@@ -159,6 +161,7 @@ class TDMPC2(struct.PyTreeNode):
         policy_actions = policy_actions.at[..., t, :].set(
             self.model.sample_actions(
                 z=z_t,
+                deterministic=False,
                 params=self.model.policy_model.params,
                 key=prior_noise_keys[t]
             )[0]
@@ -299,7 +302,7 @@ class TDMPC2(struct.PyTreeNode):
             jnp.mean((z - sg(next_zs[t]))**2, where=~finished[t][:, None])
         latent_zs = latent_zs.at[t+1].set(z)
         finished = finished.at[t+1].set(jnp.logical_or(finished[t], done[t]))
-      consistency_loss /= self.horizon
+      consistency_loss /= self.rho_loss_scale
 
       ###########################################################
       # Reward loss
@@ -308,13 +311,19 @@ class TDMPC2(struct.PyTreeNode):
           z=latent_zs[:-1], a=actions, params=reward_params,
       )
       reward_loss = jnp.mean(
-          self.rho**np.arange(self.horizon)[:, None] * soft_crossentropy(
-              reward_logits, rewards,
-              self.model.symlog_min,
-              self.model.symlog_max,
-              self.model.num_bins
-          ), where=~finished[:-1]
-      )
+          jnp.sum(
+              self.rho**np.arange(self.horizon)[:, None] *
+              soft_crossentropy(
+                  pred_logits=reward_logits,
+                  target=rewards,
+                  low=self.model.symlog_min,
+                  high=self.model.symlog_max,
+                  num_bins=self.model.num_bins
+              ),
+              axis=-2,
+              where=~finished[:-1]
+          )
+      ) / self.rho_loss_scale
 
       ###########################################################
       # Value loss
@@ -324,7 +333,10 @@ class TDMPC2(struct.PyTreeNode):
 
       # TD targets
       next_action = self.model.sample_actions(
-          z=next_zs, params=self.model.policy_model.params, key=next_action_key
+          z=next_zs,
+          deterministic=False,
+          params=self.model.policy_model.params,
+          key=next_action_key
       )[0]
       Qs, _ = self.model.Q(
           z=next_zs,
@@ -346,13 +358,19 @@ class TDMPC2(struct.PyTreeNode):
           z=latent_zs[:-1], a=actions, params=value_params, key=value_key
       )
       value_loss = jnp.mean(
-          self.rho**np.arange(self.horizon)[:, None] * soft_crossentropy(
-              Q_logits, sg(td_targets),
-              self.model.symlog_min,
-              self.model.symlog_max,
-              self.model.num_bins
-          ), where=~finished[:-1]
-      )
+          jnp.sum(
+              self.rho**np.arange(self.horizon)[:, None] *
+              soft_crossentropy(
+                  pred_logits=Q_logits,
+                  target=sg(td_targets),
+                  low=self.model.symlog_min,
+                  high=self.model.symlog_max,
+                  num_bins=self.model.num_bins
+              ),
+              axis=-2,
+              where=~finished[:-1]
+          )
+      ) / self.rho_loss_scale
 
       ###########################################################
       # Continue loss
@@ -368,10 +386,10 @@ class TDMPC2(struct.PyTreeNode):
         continue_loss = 0.0
 
       total_loss = (
-          self.consistency_coef * consistency_loss +
-          self.reward_coef * reward_loss +
-          self.value_coef * value_loss +
-          self.continue_coef * continue_loss
+          self.consistency_loss_scale * consistency_loss +
+          self.reward_loss_scale * reward_loss +
+          self.value_loss_scale * value_loss +
+          self.continue_loss_scale * continue_loss
       )
 
       return total_loss, {
@@ -423,7 +441,10 @@ class TDMPC2(struct.PyTreeNode):
     def policy_loss_fn(actor_params: flax.core.FrozenDict):
       action_key, Q_key = jax.random.split(policy_key, 2)
       actions, _, _, log_probs = self.model.sample_actions(
-          z=latent_zs, params=actor_params, key=action_key
+          z=latent_zs,
+          deterministic=False,
+          params=actor_params,
+          key=action_key
       )
 
       # Compute policy objective (equation 4)
@@ -431,13 +452,16 @@ class TDMPC2(struct.PyTreeNode):
           z=latent_zs, a=actions, params=new_value_model.params, key=Q_key
       )
       Q = Qs.mean(axis=0)
-      scale = percentile_normalization(Q[0], self.value_scale).clip(1, None)
+      Q_scale = percentile_normalization(Q[0], self.value_scale).clip(1, None)
       policy_loss = jnp.mean(
-          self.rho**jnp.arange(self.horizon+1)[:, None] *
-          (self.entropy_coef * log_probs - Q / sg(scale)),
-          where=~finished
-      )
-      return policy_loss, {'policy_loss': policy_loss, 'value_scale': scale}
+          jnp.sum(
+              self.rho**jnp.arange(self.horizon+1)[:, None] *
+              (self.entropy_coef * log_probs - Q / sg(Q_scale)),
+              axis=-2,
+              where=~finished
+          )
+      ) / self.rho_loss_scale
+      return policy_loss, {'policy_loss': policy_loss, 'value_scale': Q_scale}
 
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params
@@ -471,10 +495,10 @@ class TDMPC2(struct.PyTreeNode):
     G, discount = 0.0, 1.0
     for t in range(horizon):
       reward, _ = self.model.reward(
-          z, actions[..., t, :], self.model.reward_model.params
+          z=z, a=actions[..., t, :], params=self.model.reward_model.params
       )
       z = self.model.next(
-          z, actions[..., t, :], self.model.dynamics_model.params
+          z=z, a=actions[..., t, :], params=self.model.dynamics_model.params
       )
       G += discount * reward
       discount *= self.discount
@@ -489,11 +513,17 @@ class TDMPC2(struct.PyTreeNode):
 
     action_key, Q_key = jax.random.split(key, 2)
     next_action = self.model.sample_actions(
-        z, self.model.policy_model.params, key=action_key
+        z=z,
+        deterministic=False,
+        params=self.model.policy_model.params,
+        key=action_key
     )[0]
 
     Qs, _ = self.model.Q(
-        z, next_action, self.model.value_model.params, key=Q_key
+        z=z,
+        a=next_action,
+        params=self.model.value_model.params,
+        key=Q_key
     )
     Q = Qs.mean(axis=0)
     return G + discount * Q

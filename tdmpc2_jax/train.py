@@ -215,6 +215,7 @@ def train(cfg: dict):
             train=True,
             key=action_key
         )
+        action = np.array(action)
 
       next_observation, reward, terminated, truncated, info = env.step(action)
 
