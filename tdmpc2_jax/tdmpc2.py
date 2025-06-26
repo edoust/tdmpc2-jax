@@ -440,7 +440,7 @@ class TDMPC2(struct.PyTreeNode):
 
     def policy_loss_fn(actor_params: flax.core.FrozenDict):
       action_key, Q_key = jax.random.split(policy_key, 2)
-      actions, _, _, log_probs = self.model.sample_actions(
+      actions, _, log_std, log_probs = self.model.sample_actions(
           z=latent_zs,
           deterministic=False,
           params=actor_params,
@@ -461,7 +461,11 @@ class TDMPC2(struct.PyTreeNode):
               where=~finished
           )
       ) / self.rho_loss_scale
-      return policy_loss, {'policy_loss': policy_loss, 'value_scale': Q_scale}
+      return policy_loss, {
+          'policy_loss': policy_loss,
+          'policy_log_std': log_std,
+          'value_scale': Q_scale
+      }
 
     policy_grads, policy_info = jax.grad(policy_loss_fn, has_aux=True)(
         self.model.policy_model.params
