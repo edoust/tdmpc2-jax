@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import optax
 from tdmpc2_jax.networks import Ensemble
 from tdmpc2_jax.common.util import symlog, two_hot_inv
+import tensorflow_probability.substrates.jax.distributions as tfd
 
 
 class WorldModel(struct.PyTreeNode):
@@ -236,21 +237,25 @@ class WorldModel(struct.PyTreeNode):
   def encode(self, obs: np.ndarray, params: Dict, key: PRNGKeyArray) -> jax.Array:
     if self.symlog_obs:
       obs = jax.tree.map(lambda x: symlog(x), obs)
-    z = self.encoder.apply_fn({'params': params}, obs, rngs={'dropout': key})
+    z = self.encoder.apply_fn(
+        {'params': params}, obs, rngs={'dropout': key}
+    ).astype(jnp.float32)
     return simnorm(z, simplex_dim=self.simnorm_dim)
 
   @jax.jit
   def next(self, z: jax.Array, a: jax.Array, params: Dict) -> jax.Array:
     z = self.dynamics_model.apply_fn(
         {'params': params}, jnp.concatenate([z, a], axis=-1)
-    )
+    ).astype(jnp.float32)
     return simnorm(z, simplex_dim=self.simnorm_dim)
 
   @jax.jit
   def reward(self, z: jax.Array, a: jax.Array, params: Dict
              ) -> Tuple[jax.Array, jax.Array]:
     z = jnp.concatenate([z, a], axis=-1)
-    logits = self.reward_model.apply_fn({'params': params}, z)
+    logits = self.reward_model.apply_fn(
+        {'params': params}, z
+    ).astype(jnp.float32)
     reward = two_hot_inv(
         logits, self.symlog_min, self.symlog_max, self.num_bins
     )
@@ -268,26 +273,26 @@ class WorldModel(struct.PyTreeNode):
                      ) -> Tuple[jax.Array, ...]:
     # Chunk the policy model output to get mean and logstd
     mean, log_std = jnp.split(
-        self.policy_model.apply_fn({'params': params}, z), 2, axis=-1
+        self.policy_model.apply_fn({'params': params}, z).astype(jnp.float32), 2, axis=-1
     )
     log_std = min_log_std + 0.5 * \
         (max_log_std - min_log_std) * (jnp.tanh(log_std) + 1)
 
-    # Sample action and compute logprobs
+    action_dist = tfd.MultivariateNormalDiag(
+        loc=mean, scale_diag=jnp.exp(log_std)
+    )
     if deterministic:
-        eps = jnp.zeros_like(mean)
-        action = mean
+      action = mean
     else:
-        eps = jax.random.normal(key, mean.shape)
-        action = mean + eps * jnp.exp(log_std)
-    residual = (-0.5 * eps**2 - log_std).sum(-1)
-    log_probs = action.shape[-1] * (residual - 0.5 * jnp.log(2 * jnp.pi))
+      action = action_dist.sample(seed=key)
+    log_probs = action_dist.log_prob(action)
 
     # Squash tanh
+    log_probs -= jnp.sum(
+        (2 * (jnp.log(2) - action - jax.nn.softplus(-2 * action))), axis=-1
+    )
     mean = jnp.tanh(mean)
     action = jnp.tanh(action)
-    log_probs -= jnp.log(nn.relu(1 - action**2) + 1e-6).sum(-1)
-
     return action, mean, log_std, log_probs
 
   @jax.jit
@@ -296,7 +301,7 @@ class WorldModel(struct.PyTreeNode):
     z = jnp.concatenate([z, a], axis=-1)
     logits = self.value_model.apply_fn(
         {'params': params}, z, rngs={'dropout': key}
-    )
+    ).astype(jnp.float32)
 
     Q = two_hot_inv(logits, self.symlog_min, self.symlog_max, self.num_bins)
     return Q, logits

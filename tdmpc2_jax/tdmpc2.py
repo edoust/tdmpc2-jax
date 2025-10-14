@@ -32,7 +32,6 @@ class TDMPC2(struct.PyTreeNode):
   batch_size: int = struct.field(pytree_node=False)
   discount: float
   rho: float
-  rho_loss_scale: float
   consistency_loss_scale: float
   reward_loss_scale: float
   value_loss_scale: float
@@ -76,7 +75,6 @@ class TDMPC2(struct.PyTreeNode):
                discount=discount,
                batch_size=batch_size,
                rho=rho,
-               rho_loss_scale=jnp.sum(rho**jnp.arange(horizon)),
                consistency_loss_scale=consistency_loss_scale,
                reward_loss_scale=reward_loss_scale,
                value_loss_scale=value_loss_scale,
@@ -270,6 +268,8 @@ class TDMPC2(struct.PyTreeNode):
                             continue_params: flax.core.FrozenDict,
                             ) -> Tuple[jax.Array, Dict[str, Any]]:
       encoder_key, value_key = jax.random.split(world_model_key, 2)
+      lam = self.rho**jnp.arange(self.horizon)
+      lam /= jnp.sum(lam)
 
       ###########################################################
       # Encoder forward pass
@@ -298,11 +298,10 @@ class TDMPC2(struct.PyTreeNode):
         z = self.model.next(
             z=latent_zs[t], a=actions[t], params=dynamics_params
         )
-        consistency_loss += self.rho**t * \
+        consistency_loss += lam[t] * \
             jnp.mean((z - sg(next_zs[t]))**2, where=~finished[t][:, None])
         latent_zs = latent_zs.at[t+1].set(z)
         finished = finished.at[t+1].set(jnp.logical_or(finished[t], done[t]))
-      consistency_loss /= self.rho_loss_scale
 
       ###########################################################
       # Reward loss
@@ -310,20 +309,15 @@ class TDMPC2(struct.PyTreeNode):
       _, reward_logits = self.model.reward(
           z=latent_zs[:-1], a=actions, params=reward_params,
       )
-      reward_loss = jnp.mean(
-          jnp.sum(
-              self.rho**np.arange(self.horizon)[:, None] *
-              soft_crossentropy(
-                  pred_logits=reward_logits,
-                  target=rewards,
-                  low=self.model.symlog_min,
-                  high=self.model.symlog_max,
-                  num_bins=self.model.num_bins
-              ),
-              axis=-2,
-              where=~finished[:-1]
-          )
-      ) / self.rho_loss_scale
+      reward_loss = jnp.sum(
+          lam[:, None] * soft_crossentropy(
+              pred_logits=reward_logits,
+              target=rewards,
+              low=self.model.symlog_min,
+              high=self.model.symlog_max,
+              num_bins=self.model.num_bins,
+          ), axis=0, where=~finished[:-1]
+      ).mean()
 
       ###########################################################
       # Value loss
@@ -357,20 +351,15 @@ class TDMPC2(struct.PyTreeNode):
       _, Q_logits = self.model.Q(
           z=latent_zs[:-1], a=actions, params=value_params, key=value_key
       )
-      value_loss = jnp.mean(
-          jnp.sum(
-              self.rho**np.arange(self.horizon)[:, None] *
-              soft_crossentropy(
-                  pred_logits=Q_logits,
-                  target=sg(td_targets),
-                  low=self.model.symlog_min,
-                  high=self.model.symlog_max,
-                  num_bins=self.model.num_bins
-              ),
-              axis=-2,
-              where=~finished[:-1]
-          )
-      ) / self.rho_loss_scale
+      value_loss = jnp.sum(
+          lam[:, None] * soft_crossentropy(
+              pred_logits=Q_logits,
+              target=sg(td_targets),
+              low=self.model.symlog_min,
+              high=self.model.symlog_max,
+              num_bins=self.model.num_bins
+          ), axis=1, where=~finished[:-1]
+      ).mean()
 
       ###########################################################
       # Continue loss
@@ -448,19 +437,17 @@ class TDMPC2(struct.PyTreeNode):
       )
 
       # Compute policy objective (equation 4)
+      lam = self.rho**jnp.arange(self.horizon+1)
+      lam /= jnp.sum(lam)
       Qs, _ = self.model.Q(
           z=latent_zs, a=actions, params=new_value_model.params, key=Q_key
       )
       Q = Qs.mean(axis=0)
       Q_scale = percentile_normalization(Q[0], self.value_scale).clip(1, None)
-      policy_loss = jnp.mean(
-          jnp.sum(
-              self.rho**jnp.arange(self.horizon+1)[:, None] *
-              (self.entropy_coef * log_probs - Q / sg(Q_scale)),
-              axis=-2,
-              where=~finished
-          )
-      ) / self.rho_loss_scale
+      policy_loss = jnp.sum(
+          lam[:, None] * (self.entropy_coef * log_probs - Q / sg(Q_scale)),
+          axis=0, where=~finished
+      ).mean()
       return policy_loss, {
           'policy_loss': policy_loss,
           'policy_log_std': log_std,
