@@ -58,7 +58,6 @@ class WorldModel(struct.PyTreeNode):
              learning_rate: float,
              max_grad_norm: float = 20,
              # Misc
-
              tabulate: bool = False,
              dtype: jnp.dtype = jnp.float32,
              *,
@@ -80,7 +79,7 @@ class WorldModel(struct.PyTreeNode):
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
-            optax.adam(learning_rate),
+            optax.adamw(learning_rate),
         )
     )
 
@@ -97,7 +96,7 @@ class WorldModel(struct.PyTreeNode):
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
-            optax.adam(learning_rate),
+            optax.adamw(learning_rate),
         )
     )
 
@@ -114,7 +113,7 @@ class WorldModel(struct.PyTreeNode):
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
-            optax.adam(learning_rate),
+            optax.adamw(learning_rate),
         )
     )
 
@@ -135,7 +134,7 @@ class WorldModel(struct.PyTreeNode):
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
-            optax.adam(learning_rate),
+            optax.adamw(learning_rate),
         )
     )
     target_value_model = TrainState.create(
@@ -156,7 +155,7 @@ class WorldModel(struct.PyTreeNode):
           tx=optax.chain(
               optax.zero_nans(),
               optax.clip_by_global_norm(max_grad_norm),
-              optax.adam(learning_rate),
+              optax.adamw(learning_rate),
           )
       )
     else:
