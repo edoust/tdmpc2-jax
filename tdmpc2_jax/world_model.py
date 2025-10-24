@@ -36,7 +36,6 @@ class WorldModel(struct.PyTreeNode):
   symlog_min: float
   symlog_max: float
   predict_continues: bool = struct.field(pytree_node=False)
-  symlog_obs: bool = struct.field(pytree_node=False)
 
   @classmethod
   def create(cls,
@@ -53,7 +52,6 @@ class WorldModel(struct.PyTreeNode):
              symlog_max: float,
              simnorm_dim: int,
              predict_continues: bool,
-             symlog_obs: bool,
              # Optimization
              learning_rate: float,
              max_grad_norm: float = 20,
@@ -229,13 +227,10 @@ class WorldModel(struct.PyTreeNode):
         symlog_min=float(symlog_min),
         symlog_max=float(symlog_max),
         predict_continues=predict_continues,
-        symlog_obs=symlog_obs
     )
 
   @jax.jit
   def encode(self, obs: np.ndarray, params: Dict, key: PRNGKeyArray) -> jax.Array:
-    if self.symlog_obs:
-      obs = jax.tree.map(lambda x: symlog(x), obs)
     z = self.encoder.apply_fn(
         {'params': params}, obs, rngs={'dropout': key}
     ).astype(jnp.float32)

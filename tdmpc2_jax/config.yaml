@@ -32,7 +32,6 @@ world_model:
   num_bins: 101
   symlog_min: -10
   symlog_max: 10
-  symlog_obs: False
   simnorm_dim: 8
   learning_rate: 3e-4
   predict_continues: False
