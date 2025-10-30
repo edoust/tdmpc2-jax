@@ -11,8 +11,8 @@ class NormedLinear(nn.Module):
   activation: Callable[[jax.Array], jax.Array] = None
   dropout_rate: Optional[float] = None
 
-  kernel_init: Callable = nn.initializers.truncated_normal(0.02)
-  dtype: jnp.dtype = jnp.float32  # Switch this to bfloat16 for speed
+  kernel_init: Callable = nn.initializers.truncated_normal(stddev=0.02)
+  dtype: jnp.dtype = jnp.float32
   param_dtype: jnp.dtype = jnp.float32
 
   @nn.compact
@@ -25,7 +25,7 @@ class NormedLinear(nn.Module):
                  dtype=self.dtype,
                  param_dtype=self.param_dtype)(x)
 
-    x = nn.LayerNorm()(x)
+    x = nn.LayerNorm(dtype=self.dtype)(x)
     if self.activation is not None:
       x = self.activation(x)
 
