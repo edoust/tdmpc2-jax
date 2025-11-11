@@ -245,7 +245,7 @@ class TDMPC2(struct.PyTreeNode):
     else:
       final_action = action[..., 0, :]
 
-    return final_action.clip(-1, 1), (mean, std)
+    return final_action.clip(-1, 1), (action, std)
 
   @jax.jit
   def update(self,
