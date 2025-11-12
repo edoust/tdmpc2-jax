@@ -94,12 +94,7 @@ class TDMPC2(struct.PyTreeNode):
           *,
           key: PRNGKeyArray
           ) -> Tuple[np.ndarray, Optional[Tuple[jax.Array]]]:
-    encoder_key, action_key = jax.random.split(key, 2)
-    z = self.model.encode(
-        obs=obs,
-        params=self.model.encoder.params,
-        key=encoder_key
-    )
+    z = self.model.encode(obs=obs, params=self.model.encoder.params)
 
     if mpc:
       action, plan = self.plan(
@@ -108,14 +103,14 @@ class TDMPC2(struct.PyTreeNode):
           prev_plan=prev_plan,
           deterministic=deterministic,
           train=train,
-          key=action_key
+          key=key
       )
     else:
       action, _, _, _ = self.model.sample_actions(
           z=z,
           deterministic=deterministic,
           params=self.model.policy_model.params,
-          key=action_key
+          key=key
       )
       plan = None
 
@@ -207,7 +202,11 @@ class TDMPC2(struct.PyTreeNode):
 
       # Compute elites
       values = self.estimate_value(
-          z=z_t, actions=actions, horizon=horizon, key=value_keys[i]
+          z=z_t,
+          actions=actions,
+          horizon=horizon,
+          train=train,
+          key=value_keys[i]
       )
       elite_values, elite_inds = jax.lax.top_k(values, self.num_elites)
       elite_actions = jnp.take_along_axis(
@@ -267,7 +266,6 @@ class TDMPC2(struct.PyTreeNode):
                             reward_params: flax.core.FrozenDict,
                             continue_params: flax.core.FrozenDict,
                             ) -> Tuple[jax.Array, Dict[str, Any]]:
-      encoder_key, value_key = jax.random.split(world_model_key, 2)
       lam = self.rho**jnp.arange(self.horizon)
       lam /= jnp.sum(lam)
 
@@ -278,9 +276,7 @@ class TDMPC2(struct.PyTreeNode):
           lambda x, y: jnp.stack([x, y], axis=0),
           observations, next_observations
       )
-      all_zs = self.model.encode(
-          obs=all_obs, params=encoder_params, key=encoder_key
-      )
+      all_zs = self.model.encode(obs=all_obs, params=encoder_params)
       encoder_zs = jax.tree.map(lambda x: x[0], all_zs)
       next_zs = jax.tree.map(lambda x: x[1], all_zs)
 
@@ -323,7 +319,7 @@ class TDMPC2(struct.PyTreeNode):
       # Value loss
       ###########################################################
       next_action_key, value_target_key, ensemble_key, value_key = \
-          jax.random.split(value_key, 4)
+          jax.random.split(world_model_key, 4)
 
       # TD targets
       next_action = self.model.sample_actions(
@@ -335,21 +331,27 @@ class TDMPC2(struct.PyTreeNode):
       Qs, _ = self.model.Q(
           z=next_zs,
           a=next_action,
+          train=True,
           params=self.model.target_value_model.params,
           key=value_target_key
       )
       # Subsample value networks
-      inds = jax.random.choice(
-          ensemble_key,
-          jnp.arange(0, self.model.num_value_nets),
-          shape=(2, ),
-          replace=False
-      )
-      Q = Qs[inds].min(axis=0)
+      Q = Qs[
+          jax.random.choice(
+              ensemble_key,
+              jnp.arange(0, self.model.num_value_nets),
+              shape=(2, ),
+              replace=False
+          )
+      ].min(axis=0)
       td_targets = rewards + (1 - terminated) * self.discount * Q
 
       _, Q_logits = self.model.Q(
-          z=latent_zs[:-1], a=actions, params=value_params, key=value_key
+          z=latent_zs[:-1],
+          a=actions,
+          train=True,
+          params=value_params,
+          key=value_key
       )
       value_loss = jnp.sum(
           lam[:, None] * soft_crossentropy(
@@ -440,7 +442,11 @@ class TDMPC2(struct.PyTreeNode):
       lam = self.rho**jnp.arange(self.horizon+1)
       lam /= jnp.sum(lam)
       Qs, _ = self.model.Q(
-          z=latent_zs, a=actions, params=new_value_model.params, key=Q_key
+          z=latent_zs,
+          a=actions,
+          train=True,
+          params=new_value_model.params,
+          key=Q_key
       )
       Q = Qs.mean(axis=0)
       Q_scale = percentile_normalization(Q[0], self.value_scale).clip(1, None)
@@ -476,11 +482,12 @@ class TDMPC2(struct.PyTreeNode):
 
     return new_agent, info
 
-  @partial(jax.jit, static_argnames=('horizon'))
+  @partial(jax.jit, static_argnames=('horizon', 'train'))
   def estimate_value(self,
                      z: jax.Array,
                      actions: jax.Array,
                      horizon: int,
+                     train: bool,
                      key: PRNGKeyArray
                      ) -> jax.Array:
     G, discount = 0.0, 1.0
@@ -513,6 +520,7 @@ class TDMPC2(struct.PyTreeNode):
     Qs, _ = self.model.Q(
         z=z,
         a=next_action,
+        train=train,
         params=self.model.value_model.params,
         key=Q_key
     )

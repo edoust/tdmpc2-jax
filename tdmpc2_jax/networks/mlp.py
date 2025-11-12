@@ -16,9 +16,11 @@ class NormedLinear(nn.Module):
   param_dtype: jnp.dtype = jnp.float32
 
   @nn.compact
-  def __call__(self,
-               x: jax.Array,
-               train: bool = True) -> jax.Array:
+  def __call__(
+      self,
+      x: jax.Array,
+      train: bool = True
+  ) -> jax.Array:
     x = nn.Dense(features=self.features,
                  kernel_init=self.kernel_init,
                  bias_init=nn.initializers.zeros_init(),

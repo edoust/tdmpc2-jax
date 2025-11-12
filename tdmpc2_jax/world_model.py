@@ -1,20 +1,19 @@
 import copy
 from functools import partial
-from typing import Dict, Tuple, Callable
+from typing import Dict, Tuple, Any
+
 import flax.linen as nn
-from flax.training.train_state import TrainState
-from flax import struct
-import numpy as np
-from numpy.typing import ArrayLike
-from tdmpc2_jax.networks import NormedLinear
-from tdmpc2_jax.common.activations import mish, simnorm
-from jaxtyping import PRNGKeyArray
 import jax
 import jax.numpy as jnp
 import optax
-from tdmpc2_jax.networks import Ensemble
-from tdmpc2_jax.common.util import symlog, two_hot_inv
 import tensorflow_probability.substrates.jax.distributions as tfd
+from flax import struct
+from flax.training.train_state import TrainState
+from jaxtyping import PRNGKeyArray, PyTree
+
+from tdmpc2_jax.common.activations import mish, simnorm
+from tdmpc2_jax.common.util import two_hot_inv
+from tdmpc2_jax.networks import Ensemble, NormedLinear
 
 
 class WorldModel(struct.PyTreeNode):
@@ -61,8 +60,8 @@ class WorldModel(struct.PyTreeNode):
              *,
              key: PRNGKeyArray,
              ):
-    dynamics_key, reward_key, value_key, policy_key, continue_key = jax.random.split(
-        key, 5)
+    dynamics_key, reward_key, value_key, policy_key, continue_key = \
+        jax.random.split(key, 5)
 
     # Latent forward dynamics model
     dynamics_module = nn.Sequential([
@@ -230,22 +229,29 @@ class WorldModel(struct.PyTreeNode):
     )
 
   @jax.jit
-  def encode(self, obs: np.ndarray, params: Dict, key: PRNGKeyArray) -> jax.Array:
-    z = self.encoder.apply_fn(
-        {'params': params}, obs, rngs={'dropout': key}
-    ).astype(jnp.float32)
+  def encode(self, obs: PyTree, params: Dict[str, Any]) -> jax.Array:
+    z = self.encoder.apply_fn({'params': params}, obs).astype(jnp.float32)
     return simnorm(z, simplex_dim=self.simnorm_dim)
 
   @jax.jit
-  def next(self, z: jax.Array, a: jax.Array, params: Dict) -> jax.Array:
+  def next(
+      self,
+      z: jax.Array,
+      a: jax.Array,
+      params: Dict[str, Any]
+  ) -> jax.Array:
     z = self.dynamics_model.apply_fn(
         {'params': params}, jnp.concatenate([z, a], axis=-1)
     ).astype(jnp.float32)
     return simnorm(z, simplex_dim=self.simnorm_dim)
 
   @jax.jit
-  def reward(self, z: jax.Array, a: jax.Array, params: Dict
-             ) -> Tuple[jax.Array, jax.Array]:
+  def reward(
+      self,
+      z: jax.Array,
+      a: jax.Array,
+      params: Dict[str, Any]
+  ) -> Tuple[jax.Array, jax.Array]:
     z = jnp.concatenate([z, a], axis=-1)
     logits = self.reward_model.apply_fn(
         {'params': params}, z
@@ -256,15 +262,16 @@ class WorldModel(struct.PyTreeNode):
     return reward, logits
 
   @partial(jax.jit, static_argnames=('deterministic',))
-  def sample_actions(self,
-                     z: jax.Array,
-                     params: Dict,
-                     deterministic: bool = False,
-                     min_log_std: float = -10,
-                     max_log_std: float = 2,
-                     *,
-                     key: PRNGKeyArray
-                     ) -> Tuple[jax.Array, ...]:
+  def sample_actions(
+      self,
+      z: jax.Array,
+      params: Dict[str, Any],
+      deterministic: bool = False,
+      min_log_std: float = -10,
+      max_log_std: float = 2,
+      *,
+      key: PRNGKeyArray
+  ) -> Tuple[jax.Array, ...]:
     # Chunk the policy model output to get mean and logstd
     mean, log_std = jnp.split(
         self.policy_model.apply_fn({'params': params}, z).astype(jnp.float32), 2, axis=-1
@@ -289,12 +296,18 @@ class WorldModel(struct.PyTreeNode):
     action = jnp.tanh(action)
     return action, mean, log_std, log_probs
 
-  @jax.jit
-  def Q(self, z: jax.Array, a: jax.Array, params: Dict, key: PRNGKeyArray
-        ) -> Tuple[jax.Array, jax.Array]:
+  @partial(jax.jit, static_argnames=('train',))
+  def Q(
+      self,
+      z: jax.Array,
+      a: jax.Array,
+      train: bool,
+      params: Dict[str, Any],
+      key: PRNGKeyArray
+  ) -> Tuple[jax.Array, jax.Array]:
     z = jnp.concatenate([z, a], axis=-1)
     logits = self.value_model.apply_fn(
-        {'params': params}, z, rngs={'dropout': key}
+        {'params': params}, z, train, rngs={'dropout': key}
     ).astype(jnp.float32)
 
     Q = two_hot_inv(logits, self.symlog_min, self.symlog_max, self.num_bins)
