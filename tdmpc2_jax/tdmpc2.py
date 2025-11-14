@@ -220,12 +220,11 @@ class TDMPC2(struct.PyTreeNode):
       )
 
       if self.normalize_elite_values:
-        # Normalize elite values to make action selection invariant to the value scale as in [1]
-        # [1] Williams2016 - Aggressive driving with model predictive
-        # integral control
+        # Normalize elites to make softmax invariant to value scale as in [1]
+        # [1] Williams2016 - Aggressive driving with model predictive integral control 
         scale = self.normed_elite_scale / (
             abs(elite_values).mean(axis=-1) + 1e-8
-        )
+        ) / self.temperature
         elite_values = scale[..., None] * elite_values
 
       # Update population distribution
