@@ -218,13 +218,13 @@ class TDMPC2(struct.PyTreeNode):
       elite_actions = jnp.take_along_axis(
           actions, elite_inds[..., None, None], axis=-3
       )
+
       if self.normalize_elite_values:
         # Normalize elite values to make action selection invariant to the value scale as in [1]
-        # [1] Williams2016 - Aggressive driving with model predictive 
+        # [1] Williams2016 - Aggressive driving with model predictive
         # integral control
         percentiles = jnp.percentile(
-            elite_values-elite_values.min(axis=-1, keepdims=True),
-            jnp.array([5, 95]), axis=-1
+            abs(elite_values), jnp.array([5, 95]), axis=-1
         )
         scale = self.normed_elite_scale / (percentiles.mean(axis=0) + 1e-8)
         elite_values = scale[..., None] * elite_values
