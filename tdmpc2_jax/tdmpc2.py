@@ -222,9 +222,15 @@ class TDMPC2(struct.PyTreeNode):
       if self.normalize_elite_values:
         # Normalize elites to make softmax invariant to value scale as in [1]
         # [1] Williams2016 - Aggressive driving with model predictive integral control
-        max_value = abs(elite_values).max(axis=-1, keepdims=True)
-        elite_values *= self.normalized_elite_scale / \
-            (max_value.clip(1, None) * self.temperature)
+        elite_values = elite_values - \
+            elite_values.min(axis=-1, keepdims=True).clip(None, 0)
+        mean_value = elite_values.mean(axis=-1, keepdims=True)
+        scale = self.normalized_elite_scale / self.temperature
+        elite_values = jnp.where(
+            mean_value > self.normalized_elite_scale,
+            elite_values / mean_value * scale,
+            elite_values
+        )
 
       # Update population distribution
       score = jax.nn.softmax(self.temperature * elite_values)
@@ -315,7 +321,7 @@ class TDMPC2(struct.PyTreeNode):
       ###########################################################
       # Reward loss
       ###########################################################
-      _, reward_logits = self.model.reward(
+      reward_pred, reward_logits = self.model.reward(
           z=latent_zs[:-1], a=actions, params=reward_params,
       )
       reward_loss = jnp.sum(
@@ -326,6 +332,11 @@ class TDMPC2(struct.PyTreeNode):
               high=self.model.symlog_max,
               num_bins=self.model.num_bins,
           ), axis=0, where=~finished[:-1]
+      ).mean()
+
+      reward_mae = jnp.sum(
+          lam[:, None] * abs(reward_pred - rewards),
+          axis=0, where=~finished[:-1]
       ).mean()
 
       ###########################################################
@@ -359,7 +370,7 @@ class TDMPC2(struct.PyTreeNode):
       ].min(axis=0)
       td_targets = rewards + (1 - terminated) * self.discount * Q
 
-      _, Q_logits = self.model.Q(
+      value_pred, value_logits = self.model.Q(
           z=latent_zs[:-1],
           a=actions,
           train=True,
@@ -368,12 +379,17 @@ class TDMPC2(struct.PyTreeNode):
       )
       value_loss = jnp.sum(
           lam[:, None] * soft_crossentropy(
-              pred_logits=Q_logits,
+              pred_logits=value_logits,
               target=sg(td_targets),
               low=self.model.symlog_min,
               high=self.model.symlog_max,
               num_bins=self.model.num_bins
           ), axis=1, where=~finished[:-1]
+      ).mean()
+
+      value_mae = jnp.sum(
+          lam[:, None] * abs(value_pred - td_targets),
+          axis=1, where=~finished[:-1]
       ).mean()
 
       ###########################################################
@@ -404,6 +420,9 @@ class TDMPC2(struct.PyTreeNode):
           'total_loss': total_loss,
           'latent_zs': latent_zs,
           'finished': finished,
+          # Additional metrics
+          'reward_mae': reward_mae,
+          'value_mae': value_mae,
       }
 
     # Update world model
