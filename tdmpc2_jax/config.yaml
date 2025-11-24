@@ -47,7 +47,7 @@ tdmpc2:
   policy_prior_samples: 24
   num_elites: 64
   normalize_elite_values: False
-  normalized_elite_scale: 10
+  normalized_elite_scale: 100
   min_plan_std: 0.05
   max_plan_std: 2
   temperature: 0.5
